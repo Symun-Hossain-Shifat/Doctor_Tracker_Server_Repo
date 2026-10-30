@@ -3,19 +3,19 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Allowed Origins
+// CORS Configuration
 const allowedOrigins = [
     "http://localhost:3000",
     "https://doctor-tracker-client-seven.vercel.app",
 ];
 
-// Middleware
 app.use(
     cors({
         origin: allowedOrigins,
@@ -29,36 +29,46 @@ app.use(express.json());
 const uri = process.env.MONGODB_URI;
 
 if (!uri) {
-    throw new Error("MONGODB_URI is missing in environment variables!");
+    throw new Error("MONGODB_URI is missing!");
 }
 
 const client = new MongoClient(uri);
 
-let db;
+let dbPromise;
 
-// Connect to MongoDB
-export async function connectToMongoDB() {
-    try {
-        await client.connect();
-
-        db = client.db("DoctorTracker");
-
-        console.log("Successfully connected to MongoDB!");
-
-        return db;
-    } catch (error) {
-        console.error("MongoDB connection failed:", error);
-        throw error;
+async function getDB() {
+    if (!dbPromise) {
+        dbPromise = client.connect()
+            .then(() => {
+                console.log("MongoDB connected successfully!");
+                return client.db("DoctorTracker");
+            })
+            .catch((error) => {
+                dbPromise = null;
+                throw error;
+            });
     }
+
+    return dbPromise;
 }
 
-// Export Database
-export function getDB() {
-    if (!db) {
-        throw new Error("Database is not connected!");
+// JWT Configuration
+let JWKS;
+
+function getJWKS() {
+    if (!JWKS) {
+        if (!process.env.CLIENT_URL) {
+            throw new Error("CLIENT_URL is missing!");
+        }
+
+        const jwksURL = new URL(
+            `${process.env.CLIENT_URL}/api/auth/jwks`
+        );
+
+        JWKS = createRemoteJWKSet(jwksURL);
     }
 
-    return db;
+    return JWKS;
 }
 
 // Home Route
@@ -66,84 +76,172 @@ app.get("/", (req, res) => {
     res.status(200).send("Welcome to Doctor Tracker Server!");
 });
 
+// Health Check
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        success: true,
+        message: "Server is running!",
+    });
+});
 
-const DBName = client.db("DoctorTracker");
-const DoctorCollection = DBName.collection("DoctorCollection")
-const PatientCollection = DBName.collection("PatientCollection")
+// Authentication Middleware
+const VerifyToken = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
 
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({
+                message: "Unauthorized access",
+            });
+        }
 
-app.get('/api/Doctors', async (req, res) => {
-    const Data = await DoctorCollection.find().toArray()
-    res.send(Data)
-})
+        const token = authHeader.split(" ")[1];
 
-app.get('/api/Patiens', async (req, res) => {
+        const { payload } = await jwtVerify(token, getJWKS());
+
+        if (!payload.sub || !ObjectId.isValid(payload.sub)) {
+            return res.status(403).json({
+                message: "Invalid user token",
+            });
+        }
+
+        const db = await getDB();
+        const UsersCollection = db.collection("user");
+
+        const user = await UsersCollection.findOne({
+            _id: new ObjectId(payload.sub),
+        });
+
+        if (!user) {
+            return res.status(401).json({
+                message: "User not found",
+            });
+        }
+
+        req.user = user;
+        req.db = db;
+
+        next();
+
+    } catch (error) {
+        console.error("Authentication Error:", error);
+
+        return res.status(403).json({
+            message: "Forbidden",
+        });
+    }
+};
+
+// GET Doctors
+app.get("/api/Doctors", VerifyToken, async (req, res) => {
+    try {
+        const data = await req.db
+            .collection("DoctorCollection")
+            .find()
+            .toArray();
+
+        res.status(200).json(data);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            message: "Failed to get doctors",
+        });
+    }
+});
+
+// GET Patients
+app.get("/api/Patiens", VerifyToken, async (req, res) => {
     try {
         const { doctorId } = req.query;
 
         const query = doctorId ? { doctorId } : {};
 
-        const Data = await PatientCollection
+        const data = await req.db
+            .collection("PatientCollection")
             .find(query)
             .toArray();
 
-        res.status(200).json(Data);
+        res.status(200).json(data);
 
     } catch (error) {
         console.error(error);
 
         res.status(500).json({
             message: "Failed to get patients",
-            error: error.message
+            error: error.message,
         });
     }
 });
 
-
-app.delete('/api/Patiens/:id', async (req, res) => {
-    const { id } = req.params;
+// DELETE Patient
+app.delete("/api/Patiens/:id", VerifyToken, async (req, res) => {
     try {
-        const query = { _id: new ObjectId(id) }
-        const result = await PatientCollection.deleteOne(query);
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                message: "Invalid patient ID",
+            });
+        }
+
+        const result = await req.db
+            .collection("PatientCollection")
+            .deleteOne({
+                _id: new ObjectId(id),
+            });
+
         if (result.deletedCount === 0) {
-            return res.status(404).send({
+            return res.status(404).json({
                 message: "Patient not found",
             });
         }
-        res.status(200).send(result);
+
+        res.status(200).json({
+            success: true,
+            message: "Patient deleted successfully",
+        });
+
     } catch (error) {
         console.error("DELETE Patient ERROR:", error);
-        res.status(500).send({
-            message: "Failed to delete Patient",
+
+        res.status(500).json({
+            message: "Failed to delete patient",
             error: error.message,
         });
     }
-})
+});
 
-
-
-app.patch('/api/Patiens/:id', async (req, res) => {
+// UPDATE Patient
+app.patch("/api/Patiens/:id", VerifyToken, async (req, res) => {
     try {
-        const id = new ObjectId(req.params.id);
-        const Data = req.body;
+        const { id } = req.params;
 
-        const newdata = {
-            $set: {
-                name: Data.name,
-                age: Number(Data.age),
-                gender: Data.gender,
-                phone: Data.phone,
-                email: Data.email,
-                address: Data.address,
-                condition: Data.condition,
-                admissionDate: Data.admissionDate,
-            },
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                message: "Invalid patient ID",
+            });
+        }
+
+        const data = req.body;
+
+        const updateData = {
+            name: data.name,
+            age: Number(data.age),
+            gender: data.gender,
+            phone: data.phone,
+            email: data.email,
+            address: data.address,
+            condition: data.condition,
+            admissionDate: data.admissionDate,
         };
 
-        const result = await PatientCollection.updateOne(
-            { _id: id },
-            newdata
-        );
+        const result = await req.db
+            .collection("PatientCollection")
+            .updateOne(
+                { _id: new ObjectId(id) },
+                { $set: updateData }
+            );
 
         if (result.matchedCount === 0) {
             return res.status(404).json({
@@ -155,7 +253,6 @@ app.patch('/api/Patiens/:id', async (req, res) => {
         res.status(200).json({
             success: true,
             message: "Patient updated successfully",
-            result,
         });
 
     } catch (error) {
@@ -168,93 +265,64 @@ app.patch('/api/Patiens/:id', async (req, res) => {
     }
 });
 
-
-
-
-app.post('/api/Doctors', async (req, res) => {
+// POST Doctor
+app.post("/api/Doctors", VerifyToken, async (req, res) => {
     try {
-        const Data = req.body;
+        const data = req.body;
 
-        const NewData = {
-            ...Data,
+        const newData = {
+            ...data,
             createdAt: new Date(),
         };
 
-        const result = await DoctorCollection.insertOne(NewData);
+        const result = await req.db
+            .collection("DoctorCollection")
+            .insertOne(newData);
 
-        res.status(201).send(result);
+        res.status(201).json(result);
+
     } catch (error) {
         console.error("POST Doctor ERROR:", error);
 
-        res.status(500).send({
+        res.status(500).json({
             message: "Failed to add doctor",
             error: error.message,
         });
     }
-})
-app.post('/api/Patiens', async (req, res) => {
-    try {
-        const Data = req.body;
+});
 
-        const NewData = {
-            ...Data,
+// POST Patient
+app.post("/api/Patiens", VerifyToken, async (req, res) => {
+    try {
+        const data = req.body;
+
+        const newData = {
+            ...data,
             createdAt: new Date(),
         };
 
-        const result = await PatientCollection.insertOne(NewData);
+        const result = await req.db
+            .collection("PatientCollection")
+            .insertOne(newData);
 
-        res.status(201).send(result);
+        res.status(201).json(result);
+
     } catch (error) {
         console.error("POST Patient ERROR:", error);
 
-        res.status(500).send({
-            message: "Failed to add Patient",
+        res.status(500).json({
+            message: "Failed to add patient",
             error: error.message,
         });
     }
-})
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Health Check
-app.get("/health", (req, res) => {
-    res.status(200).json({
-        success: true,
-        message: "Server is running!",
-    });
 });
 
-// Start Server
-async function startServer() {
-    try {
-        await connectToMongoDB();
+// Export Express App for Vercel
+export default app;
 
-        app.listen(port, () => {
-            console.log(`Server running on port ${port}`);
-        });
-    } catch (error) {
-        console.error("Failed to start server:", error);
-        process.exit(1);
-    }
+// Local Development
+if (process.env.NODE_ENV !== "production") {
+    app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+    });
 }
-
-startServer();

@@ -1,5 +1,5 @@
 {
-  "name": "doctor_tracker_server",
+  "name": "doctor-tracker-server",
   "version": "1.0.0",
   "description": "",
   "license": "ISC",
@@ -14,6 +14,7 @@
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^5.3.0",
+    "jose": "^5.10.0",
     "mongodb": "^7.7.0"
   },
   "devDependencies": {
